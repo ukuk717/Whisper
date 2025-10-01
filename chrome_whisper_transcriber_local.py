@@ -96,6 +96,12 @@ AUDIO_OUTPUT_DIR = _resolve_initial_dir("CWT_AUDIO_DIR", OUTPUT_DIR)
 SUMMARY_OUTPUT_DIR = _resolve_initial_dir("CWT_SUMMARY_DIR", OUTPUT_DIR)
 TMP_DIR = _ensure_writable_dir(os.path.join(SUMMARY_OUTPUT_DIR, "_tmp"))
 INDEX_MD = os.path.join(SUMMARY_OUTPUT_DIR, "_index.md")  # 一覧
+SUPPORTED_AUDIO_EXTS = {".aac", ".flac", ".m4a", ".mkv", ".mp3", ".mp4", ".ogg", ".opus", ".wav", ".webm"}
+FILE_DIALOG_PATTERN = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_AUDIO_EXTS))
+FILE_DIALOG_TYPES = [
+    ("Audio files", FILE_DIALOG_PATTERN),
+    ("All files", "*.*"),
+]
 
 
 def set_audio_output_dir(path: str) -> str:
@@ -183,7 +189,8 @@ class Job:
     wav_path: str
     chosen_subject: Optional[str]
     manual_title: Optional[str]
-    source: str = "manual"  # "manual" | "auto"
+    source: str = "manual"  # "manual" | "auto" | "import"
+    delete_after: bool = False
 
 pending_q: "queue.Queue[Job]" = queue.Queue()
 
@@ -683,7 +690,8 @@ def ensure_unique(path: str) -> str:
 
 def write_segment_markdown(subject: str, ts: str, title: str,
                            transcript_formatted: str, bullets: List[str],
-                           summary: str, wav_path: str):
+                           summary: str, wav_path: Optional[str],
+                           audio_kept: bool = True):
     summary_root = SUMMARY_OUTPUT_DIR
     os.makedirs(summary_root, exist_ok=True)
     subj_dir = os.path.join(summary_root, subject)
@@ -691,15 +699,26 @@ def write_segment_markdown(subject: str, ts: str, title: str,
     safe_title = sanitize_filename(title or "タイトルなし")
     md_name = f"{subject}_{ts}_{safe_title}.md"
     md_path = ensure_unique(os.path.join(subj_dir, md_name))
-    try:
-        rel_wav = os.path.relpath(wav_path, start=subj_dir)
-    except ValueError:
-        rel_wav = wav_path
+    rel_wav = None
+    if wav_path:
+        try:
+            rel_wav = os.path.relpath(wav_path, start=subj_dir)
+        except ValueError:
+            rel_wav = wav_path
 
     header = [
         f"# {subject} / {title}",
-        f"- 収録: {ts}",
-        f"- 音声: [{os.path.basename(wav_path)}]({rel_wav})",
+        f"- 収録: {ts}"
+    ]
+
+    if wav_path and audio_kept and rel_wav:
+        header.append(f"- 音声: [{os.path.basename(wav_path)}]({rel_wav})")
+    elif wav_path and not audio_kept:
+        header.append("- 音声: （処理後に削除）")
+    else:
+        header.append("- 音声: （保存なし）")
+
+    header.extend([
         f"- Whisper: {FW_MODEL}",
         f"- 要約モデル: {OLLAMA_MODEL}",
         "",
@@ -711,7 +730,7 @@ def write_segment_markdown(subject: str, ts: str, title: str,
         "",
         "## 文字起こし",
         transcript_formatted
-    ]
+    ])
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(header))
 
@@ -728,7 +747,12 @@ def write_segment_markdown(subject: str, ts: str, title: str,
 # ========= バックグラウンド処理 =========
 def transcribe_with_whisper_file_then_save(job, log_widget: tk.Text):
     try:
-        src = "自動" if job.source == "auto" else "手動"
+        if job.source == "auto":
+            src = "自動"
+        elif job.source == "import":
+            src = "取り込み"
+        else:
+            src = "手動"
         log_widget_insert(log_widget, f"[INFO] ({src}) キュー処理: {os.path.basename(job.wav_path)}\n")
         raw_text, formatted_text = transcribe_with_whisper_formatted(job.wav_path)
         log_widget_insert(log_widget, f"[OK] 文字起こし（{len(raw_text)}文字 / 整形後 {len(formatted_text)}文字）\n")
@@ -739,13 +763,22 @@ def transcribe_with_whisper_file_then_save(job, log_widget: tk.Text):
         subject = job.chosen_subject or struct.get("subject") or "その他"
         if subject not in SUBJECTS: subject = "その他"
         ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        audio_kept = not job.delete_after
         md_path = write_segment_markdown(
             subject=subject, ts=ts, title=struct["title"],
             transcript_formatted=formatted_text,
             bullets=struct.get("bullets", []),
-            summary=struct.get("summary",""), wav_path=job.wav_path
+            summary=struct.get("summary",""), wav_path=job.wav_path, audio_kept=audio_kept
         )
         log_widget_insert(log_widget, f"[DONE] 出力: {md_path}\n")
+        if job.delete_after:
+            try:
+                os.remove(job.wav_path)
+                log_widget_insert(log_widget, f"[CLEANUP] 音声削除 {os.path.basename(job.wav_path)}\n")
+            except FileNotFoundError:
+                log_widget_insert(log_widget, f"[WARN] 削除対象の音声が見つかりません: {job.wav_path}\n")
+            except Exception as exc:
+                log_widget_insert(log_widget, f"[WARN] 音声削除失敗 {exc}\n")
     except Exception as e:
         log_widget_insert(log_widget, f"[ERROR] {e}\n")
 
@@ -820,6 +853,9 @@ class App(tk.Tk):
         auto = ttk.Frame(self, padding=(8,0)); auto.pack(fill="x")
         self.auto_enabled = tk.BooleanVar(value=AUTO_CUT_ENABLED)
         ttk.Checkbutton(auto, text=f"無音 {AUTO_CUT_SILENCE_SEC:.1f} 秒で自動区切り", variable=self.auto_enabled).pack(side="left")
+        opts = ttk.Frame(self, padding=(8,0)); opts.pack(fill="x")
+        self.keep_audio_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="録音した音声ファイルを保存する", variable=self.keep_audio_var).pack(side="left")
 
         # ボタン群
         btn = ttk.Frame(self, padding=8); btn.pack(fill="x")
@@ -828,7 +864,8 @@ class App(tk.Tk):
         self.btn_stop  = ttk.Button(btn, text="停止", command=self.on_stop, state="disabled")
         self.btn_open_audio = ttk.Button(btn, text="音声フォルダを開く", command=self.on_open_audio)
         self.btn_open  = ttk.Button(btn, text="要約フォルダを開く", command=self.on_open)
-        for b in (self.btn_start, self.btn_cut, self.btn_stop, self.btn_open_audio, self.btn_open):
+        self.btn_import = ttk.Button(btn, text="ファイルで要約", command=self.on_import)
+        for b in (self.btn_start, self.btn_cut, self.btn_stop, self.btn_open_audio, self.btn_open, self.btn_import):
             b.pack(side="left", padx=4)
         self.btn_resume = ttk.Button(btn, text="録音再開", command=self.on_resume, state="disabled")
 
@@ -985,11 +1022,36 @@ class App(tk.Tk):
             self._show_resume_button()
             self.btn_resume.configure(state="normal")
 
-    def _queue_job(self, wav_path: str, source: str):
+    def _queue_job(self, wav_path: str, source: str, delete_after: Optional[bool] = None):
         subj = self.subject_var.get()
         chosen_subject = None if subj == "自動判定" else subj
         manual_title = (self.title_var.get() or "").strip() or None
-        pending_q.put(Job(wav_path=wav_path, chosen_subject=chosen_subject, manual_title=manual_title, source=source))
+        if delete_after is None:
+            delete_after = not self.keep_audio_var.get()
+        delete_after = bool(delete_after)
+        pending_q.put(Job(wav_path=wav_path, chosen_subject=chosen_subject, manual_title=manual_title, source=source, delete_after=delete_after))
+
+    def on_import(self):
+        paths = filedialog.askopenfilenames(
+            title="要約する音声ファイルを選択", filetypes=FILE_DIALOG_TYPES)
+        if not paths:
+            return
+        queued = 0
+        for p in paths:
+            if not p:
+                continue
+            abs_path = os.path.abspath(p)
+            ext = os.path.splitext(abs_path)[1].lower()
+            if ext not in SUPPORTED_AUDIO_EXTS:
+                if hasattr(self, "log"):
+                    log_widget_insert(self.log, f"[WARN] 非対応の音声をスキップ {os.path.basename(abs_path)}\n")
+                continue
+            self._queue_job(abs_path, source="import", delete_after=False)
+            queued += 1
+            if hasattr(self, "log"):
+                log_widget_insert(self.log, f"[IMPORT] 要約キュー追加 {os.path.basename(abs_path)}\n")
+        if queued == 0:
+            messagebox.showwarning("要約ファイル", "対応する音声ファイルが選択されませんでした。")
 
     def on_cut(self):
         try:
