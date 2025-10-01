@@ -78,22 +78,83 @@ BASE_DIR = _app_base_dir()
 OUTPUT_DIR = _resolve_output_dir()
 
 
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+_SETTINGS_LOCK = threading.Lock()
+
+
+def _load_settings_from_disk() -> dict:
+    if not os.path.isfile(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+        print(f"[WARN] settings.json has unexpected payload type: {type(data)!r}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARN] failed to read settings.json: {exc}", file=sys.stderr)
+    return {}
+
+
+def _write_settings_to_disk(data: dict) -> None:
+    tmp_path = SETTINGS_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, SETTINGS_PATH)
+    except Exception as exc:
+        print(f"[WARN] failed to write settings.json: {exc}", file=sys.stderr)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _update_settings(updates: dict) -> None:
+    if not updates:
+        return
+    global SETTINGS
+    with _SETTINGS_LOCK:
+        for key, value in updates.items():
+            if value is None:
+                SETTINGS.pop(key, None)
+            else:
+                SETTINGS[key] = value
+        data = dict(SETTINGS)
+    _write_settings_to_disk(data)
+
+
+def _get_setting_str(key: str) -> Optional[str]:
+    value = SETTINGS.get(key)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+SETTINGS = _load_settings_from_disk()
+
 def _normalize_dir(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
-def _resolve_initial_dir(env_name: str, fallback: str) -> str:
+def _resolve_initial_dir(env_name: str, fallback: str, preferred: Optional[str] = None) -> str:
     candidate = os.environ.get(env_name)
     if candidate:
         try:
             return _ensure_writable_dir(_normalize_dir(candidate))
         except Exception as exc:
-            print(f"[WARN] {env_name}={candidate} を利用できません: {exc}", file=sys.stderr)
+            print(f"[WARN] {env_name}={candidate} is not usable: {exc}", file=sys.stderr)
+    if preferred:
+        try:
+            return _ensure_writable_dir(_normalize_dir(preferred))
+        except Exception as exc:
+            print(f"[WARN] configured path {preferred} is not usable: {exc}", file=sys.stderr)
     return _ensure_writable_dir(fallback)
 
 
-AUDIO_OUTPUT_DIR = _resolve_initial_dir("CWT_AUDIO_DIR", OUTPUT_DIR)
-SUMMARY_OUTPUT_DIR = _resolve_initial_dir("CWT_SUMMARY_DIR", OUTPUT_DIR)
+AUDIO_OUTPUT_DIR = _resolve_initial_dir("CWT_AUDIO_DIR", OUTPUT_DIR, _get_setting_str("audio_dir"))
+SUMMARY_OUTPUT_DIR = _resolve_initial_dir("CWT_SUMMARY_DIR", OUTPUT_DIR, _get_setting_str("summary_dir"))
 TMP_DIR = _ensure_writable_dir(os.path.join(SUMMARY_OUTPUT_DIR, "_tmp"))
 INDEX_MD = os.path.join(SUMMARY_OUTPUT_DIR, "_index.md")  # 一覧
 SUPPORTED_AUDIO_EXTS = {".aac", ".flac", ".m4a", ".mkv", ".mp3", ".mp4", ".ogg", ".opus", ".wav", ".webm"}
@@ -107,6 +168,7 @@ FILE_DIALOG_TYPES = [
 def set_audio_output_dir(path: str) -> str:
     global AUDIO_OUTPUT_DIR
     AUDIO_OUTPUT_DIR = _ensure_writable_dir(_normalize_dir(path))
+    _update_settings({"audio_dir": AUDIO_OUTPUT_DIR})
     return AUDIO_OUTPUT_DIR
 
 
@@ -115,6 +177,7 @@ def set_summary_output_dir(path: str) -> str:
     SUMMARY_OUTPUT_DIR = _ensure_writable_dir(_normalize_dir(path))
     TMP_DIR = _ensure_writable_dir(os.path.join(SUMMARY_OUTPUT_DIR, "_tmp"))
     INDEX_MD = os.path.join(SUMMARY_OUTPUT_DIR, "_index.md")
+    _update_settings({"summary_dir": SUMMARY_OUTPUT_DIR})
     return SUMMARY_OUTPUT_DIR
 
 # ========= 科目リスト =========
@@ -820,7 +883,16 @@ class App(tk.Tk):
         ttk.Label(top, text="録音対象デバイス:").pack(side="left")
         values = [lbl for _,_,lbl in self.dev_entries]
         self.combo = ttk.Combobox(top, state="readonly", width=64, values=values)
-        self.combo.current(0); self.combo.pack(side="left", padx=8)
+        selected_idx = 0
+        saved_backend = _get_setting_str("device_backend")
+        saved_key = _get_setting_str("device_key")
+        if saved_backend and saved_key:
+            for idx, (backend, key, _) in enumerate(self.dev_entries):
+                if backend == saved_backend and key == saved_key:
+                    selected_idx = idx
+                    break
+        self.combo.current(selected_idx); self.combo.pack(side="left", padx=8)
+        self.combo.bind("<<ComboboxSelected>>", self.on_device_selected)
 
         # 科目＆タイトル
         meta = ttk.Frame(self, padding=8); meta.pack(fill="x")
@@ -904,6 +976,13 @@ class App(tk.Tk):
         backend, key, _ = self.dev_entries[i]
         return backend, key
 
+    def on_device_selected(self, event=None):
+        try:
+            backend, key = self._selected_device_key()
+        except Exception:
+            return
+        _update_settings({"device_backend": backend, "device_key": key})
+
     def set_running_ui(self, running: bool):
         self.btn_start.configure(state="disabled" if running else "normal")
         self.btn_cut.configure(state="normal" if running else "disabled")
@@ -973,6 +1052,7 @@ class App(tk.Tk):
             messagebox.showerror("Whisper初期化失敗", str(e)); return
         try:
             backend, key = self._selected_device_key()
+            _update_settings({"device_backend": backend, "device_key": key})
             start_recording((backend, key))
             self.last_device_key = (backend, key)
             self.set_running_ui(True)
@@ -1010,6 +1090,7 @@ class App(tk.Tk):
         if label is None:
             label = f"{backend}:{key}"
         try:
+            _update_settings({"device_backend": backend, "device_key": key})
             start_recording((backend, key))
             self.set_running_ui(True)
             self.auto_stop.clear()
