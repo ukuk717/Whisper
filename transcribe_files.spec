@@ -1,19 +1,37 @@
-﻿# -*- mode: python ; coding: utf-8 -*-
+# -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
-try:
-    soundcard_hidden = collect_submodules('soundcard')
-    soundcard_bins = collect_dynamic_libs('soundcard')
-    soundcard_datas = collect_data_files('soundcard')
-except ModuleNotFoundError:
-    soundcard_hidden = []
-    soundcard_bins = []
-    soundcard_datas = []
+def _collect_package_assets(package):
+    try:
+        hidden = collect_submodules(package)
+    except ModuleNotFoundError:
+        hidden = []
+    try:
+        binaries = collect_dynamic_libs(package)
+    except ModuleNotFoundError:
+        binaries = []
+    try:
+        datas = collect_data_files(package)
+    except ModuleNotFoundError:
+        datas = []
+    return hidden, binaries, datas
 
-extra_hidden = ['faster_whisper'] + soundcard_hidden
-extra_binaries = soundcard_bins
-extra_datas = soundcard_datas
+faster_hidden, faster_bins, faster_datas = _collect_package_assets('faster_whisper')
+ctrans_hidden, ctrans_bins, ctrans_datas = _collect_package_assets('ctranslate2')
+soundcard_hidden, soundcard_bins, soundcard_datas = _collect_package_assets('soundcard')
+
+
+def _dedupe(seq):
+    seen = {}
+    for item in seq:
+        if item not in seen:
+            seen[item] = None
+    return list(seen.keys())
+
+extra_hidden = _dedupe(['faster_whisper', 'ctranslate2'] + faster_hidden + ctrans_hidden + soundcard_hidden)
+extra_binaries = faster_bins + ctrans_bins + soundcard_bins
+extra_datas = faster_datas + ctrans_datas + soundcard_datas
 
 a = Analysis(
     ['transcribe_files.py'],
@@ -56,4 +74,3 @@ coll = COLLECT(
     upx_exclude=[],
     name='transcribe_files',
 )
-
