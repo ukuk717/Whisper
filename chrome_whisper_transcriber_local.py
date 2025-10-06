@@ -1,4 +1,4 @@
-# chrome_whisper_transcriber_local.py
+﻿# chrome_whisper_transcriber_local.py
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -187,12 +187,113 @@ SUBJECTS = [
     "科学と人間生活","英語コミュニケーション","情報","家庭基礎","体育","その他"
 ]
 
-# ========= Ollama（要約/科目判定/タイトル） =========
+# ========= Ollama-driven summarization settings =========
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-# instruct系の方が遵守率高（pull済なら: llama3:8b-instruct）
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3:8b")
+DEFAULT_OLLAMA_MODEL = "llama3:8b"
+OLLAMA_MODEL = (
+    os.environ.get("OLLAMA_MODEL")
+    or _get_setting_str("ollama_model")
+    or DEFAULT_OLLAMA_MODEL
+)
 
-# ========= faster-whisper（文字起こし） =========
+
+def set_ollama_model(model: str) -> str:
+    global OLLAMA_MODEL
+    model = (model or "").strip() or DEFAULT_OLLAMA_MODEL
+    OLLAMA_MODEL = model
+    _update_settings({"ollama_model": OLLAMA_MODEL})
+    return OLLAMA_MODEL
+
+
+OLLAMA_DEVICE_CHOICES = ("auto", "gpu", "cpu")
+_DEFAULT_OLLAMA_DEVICE = "auto"
+
+
+def _resolve_ollama_device() -> str:
+    env = (os.environ.get("OLLAMA_DEVICE") or "").strip().lower()
+    saved = (_get_setting_str("ollama_device") or "").strip().lower()
+    if env in OLLAMA_DEVICE_CHOICES:
+        return env
+    if saved in OLLAMA_DEVICE_CHOICES:
+        return saved
+    return _DEFAULT_OLLAMA_DEVICE
+
+
+OLLAMA_DEVICE_MODE = _resolve_ollama_device()
+
+AUTO_START_OLLAMA = os.environ.get("CWT_AUTO_START_OLLAMA", "1") != "0"
+
+def _ollama_ping(timeout: float = 1.5) -> bool:
+    try:
+        resp = requests.get(f"{OLLAMA_URL.rstrip('/')}/api/tags", timeout=timeout)
+        return resp.ok
+    except requests.RequestException:
+        return False
+
+
+def _start_ollama_server() -> None:
+    if sys.platform.startswith("win"):
+        command = "Start-Process -FilePath 'ollama' -ArgumentList 'serve' -WindowStyle Hidden"
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(stderr or f"exit code {result.returncode}")
+        return
+
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _ensure_ollama_server_running(timeout: float = 15.0) -> None:
+    if not AUTO_START_OLLAMA:
+        return
+    if _ollama_ping(timeout=1.0):
+        return
+    try:
+        _start_ollama_server()
+    except Exception as exc:
+        print(f"[WARN] Failed to auto-start ollama serve: {exc}", file=sys.stderr)
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _ollama_ping(timeout=2.0):
+            return
+        time.sleep(0.5)
+    print("[WARN] ollama serve did not become ready after auto-start.", file=sys.stderr)
+
+
+def set_ollama_device_mode(mode: str) -> str:
+    global OLLAMA_DEVICE_MODE
+    mode = (mode or "").strip().lower()
+    if mode not in OLLAMA_DEVICE_CHOICES:
+        mode = _DEFAULT_OLLAMA_DEVICE
+    OLLAMA_DEVICE_MODE = mode
+    _update_settings({"ollama_device": OLLAMA_DEVICE_MODE})
+    return OLLAMA_DEVICE_MODE
+
+
+def _ollama_num_gpu() -> Optional[int]:
+    if OLLAMA_DEVICE_MODE == "cpu":
+        return 0
+    if OLLAMA_DEVICE_MODE == "gpu":
+        return 1
+    return None
+
+
+# ========= faster-whisperによる文字起こし =========（文字起こし） =========
 FW_MODEL = os.environ.get("FW_MODEL", "medium")       # "tiny"～"large-v3"
 FW_DEVICE_CFG = os.environ.get("FW_DEVICE", "auto")   # "auto"|"cuda"|"cpu"
 FW_COMPUTE_CFG = os.environ.get("FW_COMPUTE", "")     # 省略時は自動
@@ -438,9 +539,13 @@ def _sc_recording_loop(mic_name: str, samplerate: int, channels: int):
             except Exception: pass
 
 # ========= 録音制御 =========
-def start_recording(device_key: Tuple[str,str]):
-    if state.running: return
+def start_recording(device_key: Tuple[str, str]):
+    if state.running:
+        return
     backend, ident = device_key
+    if backend == "disabled":
+        raise RuntimeError("録音デバイスが検出できないため、録音機能は利用できません。")
+
     state.backend = backend
     if backend == "sd":
         idx = int(ident.split(":")[1])
@@ -637,22 +742,26 @@ STRUCT_PROMPT = f"""
 """.strip()
 
 def _ollama_generate(model: str, prompt: str) -> str:
+    options = {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "num_ctx": 8192,
+        "num_predict": SUM_TOKENS,
+        "repeat_penalty": 1.1,
+    }
+    num_gpu = _ollama_num_gpu()
+    if num_gpu is not None:
+        options["num_gpu"] = num_gpu
     r = requests.post(
         f"{OLLAMA_URL}/api/generate",
         json={
             "model": model,
             "prompt": prompt,
-            "format": "json",      # ★ JSON強制
+            "format": "json",
             "stream": False,
-            "options": {
-                "temperature": 0.2,
-                "top_p": 0.9,
-                "num_ctx": 8192,
-                "num_predict": SUM_TOKENS,
-                "repeat_penalty": 1.1
-            }
+            "options": options,
         },
-        timeout=180
+        timeout=180,
     )
     if r.status_code == 404:
         raise RuntimeError("MODEL_NOT_FOUND")
@@ -784,6 +893,7 @@ def write_segment_markdown(subject: str, ts: str, title: str,
     header.extend([
         f"- Whisper: {FW_MODEL}",
         f"- 要約モデル: {OLLAMA_MODEL}",
+        f"- 要約モード: {OLLAMA_DEVICE_MODE}",
         "",
         "## 重要点",
         *[f"- {b}" for b in bullets],
@@ -867,6 +977,7 @@ class App(tk.Tk):
         sd_devs = list_wasapi_output_devices_sd()
         self.dev_entries: List[Tuple[str,str,str]] = []
         self.last_device_key: Optional[Tuple[str, str]] = None
+        self.loopback_unavailable = False
         if sd_devs:
             for _, idx, d in sd_devs:
                 self.dev_entries.append(("sd", f"idx:{idx}", f"[SD] {d['name']} (idx:{idx})"))
@@ -876,8 +987,14 @@ class App(tk.Tk):
             for n in sc_names:
                 self.dev_entries.append(("sc", n, f"[SC] {n} (loopback)"))
         if not self.dev_entries:
-            messagebox.showerror("エラー","ループバック録音デバイスが見つかりません。"); self.destroy(); return
-
+            self.loopback_unavailable = True
+            messagebox.showwarning(
+                "ループバックデバイスなし",
+                "ループバック録音デバイスが見つかりません。\n\nWindows のサウンド設定で\"ステレオ ミキサー\"を有効にするか、仮想オーディオデバイスを導入してください。\n\n音声ファイルのインポート機能はこのまま利用できます。"
+            )
+            self.dev_entries.append(
+                ("disabled", "none", "[録音不可] ファイル転記のみ利用できます")
+            )
         # 上段：デバイス
         top = ttk.Frame(self, padding=8); top.pack(fill="x")
         ttk.Label(top, text="録音対象デバイス:").pack(side="left")
@@ -893,7 +1010,8 @@ class App(tk.Tk):
                     break
         self.combo.current(selected_idx); self.combo.pack(side="left", padx=8)
         self.combo.bind("<<ComboboxSelected>>", self.on_device_selected)
-
+        if self.loopback_unavailable:
+            self.combo.configure(state="disabled")
         # 科目＆タイトル
         meta = ttk.Frame(self, padding=8); meta.pack(fill="x")
         ttk.Label(meta, text="科目:").pack(side="left")
@@ -921,6 +1039,33 @@ class App(tk.Tk):
         summary_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
         ttk.Button(saving, text="Browse...", command=self.on_choose_summary_dir).grid(row=1, column=2, padx=4, pady=(4, 0))
 
+        ollama = ttk.LabelFrame(self, text="Ollama設定", padding=8)
+        ollama.pack(fill="x", padx=8, pady=(0, 8))
+        ollama.columnconfigure(1, weight=1)
+
+        ttk.Label(ollama, text="使用モデル:").grid(row=0, column=0, sticky="w")
+        self.ollama_model_var = tk.StringVar(value=OLLAMA_MODEL)
+        self.ollama_model_values = [OLLAMA_MODEL]
+        self.ollama_model_combo = ttk.Combobox(ollama, textvariable=self.ollama_model_var, width=48)
+        self.ollama_model_combo.grid(row=0, column=1, sticky="ew", padx=4)
+        self.ollama_model_combo.configure(values=tuple(self.ollama_model_values))
+        self.ollama_model_combo.bind("<Return>", self.on_apply_ollama_settings)
+        ttk.Button(ollama, text="モデル取得", command=self.on_refresh_ollama_models).grid(row=0, column=2, padx=4)
+
+        ttk.Label(ollama, text="推論モード:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.ollama_device_var = tk.StringVar(value=OLLAMA_DEVICE_MODE)
+        self.ollama_device_combo = ttk.Combobox(
+            ollama,
+            state="readonly",
+            values=OLLAMA_DEVICE_CHOICES,
+            textvariable=self.ollama_device_var,
+            width=12,
+        )
+        self.ollama_device_combo.grid(row=1, column=1, sticky="w", padx=4, pady=(4, 0))
+        self.ollama_device_combo.bind("<<ComboboxSelected>>", self.on_ollama_device_selected)
+        ttk.Button(ollama, text="適用", command=self.on_apply_ollama_settings).grid(row=1, column=2, padx=4, pady=(4, 0))
+
+
         # 自動区切りの状態表示
         auto = ttk.Frame(self, padding=(8,0)); auto.pack(fill="x")
         self.auto_enabled = tk.BooleanVar(value=AUTO_CUT_ENABLED)
@@ -939,6 +1084,8 @@ class App(tk.Tk):
         self.btn_import = ttk.Button(btn, text="ファイルで要約", command=self.on_import)
         for b in (self.btn_start, self.btn_cut, self.btn_stop, self.btn_open_audio, self.btn_open, self.btn_import):
             b.pack(side="left", padx=4)
+        if self.loopback_unavailable:
+            self.btn_start.configure(state="disabled")
         self.btn_resume = ttk.Button(btn, text="録音再開", command=self.on_resume, state="disabled")
 
         # レベルメーター
@@ -1021,6 +1168,53 @@ class App(tk.Tk):
         self.summary_dir_var.set(new_dir)
         if hasattr(self, "log"):
             log_widget_insert(self.log, f"[CFG] summary_dir -> {new_dir}\n")
+
+    def on_apply_ollama_settings(self, event=None):
+        model_input = (self.ollama_model_var.get() or "").strip()
+        if not model_input:
+            messagebox.showwarning("Ollama設定", "モデル名を入力してください。")
+            self.ollama_model_var.set(OLLAMA_MODEL)
+            return
+        previous_model = OLLAMA_MODEL
+        previous_device = OLLAMA_DEVICE_MODE
+        updated_model = set_ollama_model(model_input)
+        updated_device = set_ollama_device_mode(self.ollama_device_var.get())
+        if updated_model not in self.ollama_model_values:
+            self.ollama_model_values.append(updated_model)
+            self.ollama_model_values = sorted(set(self.ollama_model_values))
+            self.ollama_model_combo.configure(values=tuple(self.ollama_model_values))
+        self.ollama_model_var.set(updated_model)
+        self.ollama_device_var.set(updated_device)
+        changes = []
+        if updated_model != previous_model:
+            changes.append(f"model -> {updated_model}")
+        if updated_device != previous_device:
+            changes.append(f"mode -> {updated_device}")
+        if changes and hasattr(self, "log"):
+            log_widget_insert(self.log, f"[CFG] Ollama {', '.join(changes)}\n")
+
+    def on_ollama_device_selected(self, event=None):
+        self.on_apply_ollama_settings()
+
+    def on_refresh_ollama_models(self):
+        try:
+            resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            messagebox.showerror("Ollamaモデル取得失敗", str(exc))
+            return
+        models = sorted({m.get("name") for m in payload.get("models", []) if isinstance(m, dict) and m.get("name")})
+        if not models:
+            messagebox.showinfo("Ollamaモデル取得", "利用可能なモデルが見つかりませんでした。")
+            return
+        self.ollama_model_values = list(models)
+        self.ollama_model_combo.configure(values=tuple(self.ollama_model_values))
+        current = (self.ollama_model_var.get() or "").strip()
+        if current not in self.ollama_model_values:
+            self.ollama_model_var.set(self.ollama_model_values[0])
+        if hasattr(self, "log"):
+            log_widget_insert(self.log, f"[INFO] Ollama models loaded ({len(self.ollama_model_values)}件)\n")
 
     def _open_directory(self, path: str):
         target = os.path.abspath(path)
@@ -1163,11 +1357,20 @@ class App(tk.Tk):
         self._open_directory(SUMMARY_OUTPUT_DIR)
 
 def main():
+    _ensure_ollama_server_running()
     if sys.platform == "win32":
         try:
             ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
-        except Exception: pass
-    app = App(); app.mainloop()
+        except Exception:
+            pass
+    app = App()
+    app.mainloop()
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
