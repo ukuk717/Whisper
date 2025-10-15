@@ -16,6 +16,9 @@
 - ver1.3.1 Patched
   - ollamaのモデルダウンロードを容易にするため、ダウンロード用スクリプト（`download_ollama_model.exe`）を実装、同梱しました。
   - exe化した際、faster-whisperがexeファイルに含まれておらず、正常に動作しない問題を修正しました。
+- ver1.4 Patched
+  - プリセットのカスタマイズがUI上から可能になりました。  そのため、軽量なモデルの使用が簡単になりました。
+  - ollamaのモデルダウンロードが、スクリプトから4種類（8B,6B,3B,2B）可能になりました。
 
 ## 概要
 - Windows向けのスタンドアロンアプリ。ChromeなどのPC音声をループバック録音し、faster-whisperで文字起こし、Ollamaで要約します。
@@ -24,9 +27,10 @@
   ただし、無音区切り/録音ファイル保存のチェックボックス設定は保持されません。
 
 ## 必要環境
-- Ollama CLIのダウンロード、インストールが必要です。[こちら](https://ollama.com/download)からダウンロードしてください。
+- 【重要】Ollama CLIのダウンロード、インストールが必要です。[こちら](https://ollama.com/download)からダウンロードしてください。
 - Windows 10/11 (64bit)、WASAPI対応のサウンドデバイス。
 - GPUを使う場合はCUDA環境をセットアップ。CPUのみでも動作します。
+-  最低要求スペック：Corei5 第8世代/8GB以上のメモリ/ストレージは少なくとも10GBの空きが必要です。RAMは8GB以上を推奨します
 
 ## 起動と操作
 1. （初回のみ）`download_ollama_model.exe`を起動し、ollamaをインストールします。
